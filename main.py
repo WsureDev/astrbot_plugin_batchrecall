@@ -9,6 +9,7 @@
 import asyncio
 import re
 import time
+from functools import wraps
 from typing import Optional
 
 from aiocqhttp.exceptions import ActionFailed
@@ -21,6 +22,20 @@ from astrbot.core.message.message_event_result import MessageChain
 from astrbot.core.platform.sources.aiocqhttp.aiocqhttp_message_event import (
     AiocqhttpMessageEvent,
 )
+
+
+def _stop_command_event(handler):
+    """Stop command events after the handler has finished processing."""
+
+    @wraps(handler)
+    async def wrapped(self, event, *args, **kwargs):
+        try:
+            async for result in handler(self, event, *args, **kwargs):
+                yield result
+        finally:
+            event.stop_event()
+
+    return wrapped
 
 
 class BatchRecall(Star):
@@ -385,12 +400,14 @@ class BatchRecall(Star):
             return False, f"撤回失败: {str(e)}"
 
     @filter.command("test_recall")
+    @_stop_command_event
     async def test_recall_command(self, event: AstrMessageEvent):
         """测试撤回功能（此测试消息会被记录并自动撤回，不标记为指令回复）"""
         recall_time = self.conf["recall_time"]
         yield event.plain_result(f"🧪 测试消息，{recall_time}秒后此消息将会撤回...")
 
     @filter.command("recall_config")
+    @_stop_command_event
     async def recall_config_command(self, event: AstrMessageEvent):
         """查看当前配置"""
         self._mark_no_auto_recall()
@@ -463,6 +480,7 @@ class BatchRecall(Star):
 
     @filter.permission_type(filter.PermissionType.ADMIN)
     @filter.command("消息列表")
+    @_stop_command_event
     async def message_list_command(self, event: AstrMessageEvent):
         """
         显示最近消息列表:消息列表 [显示数量]
@@ -552,6 +570,7 @@ class BatchRecall(Star):
 
     @filter.permission_type(filter.PermissionType.ADMIN)
     @filter.command("撤回自身")
+    @_stop_command_event
     async def recall_bot_messages_command(self, event: AstrMessageEvent):
         """
         撤回机器人自身发送的消息:撤回自身 撤回数量
@@ -679,6 +698,7 @@ class BatchRecall(Star):
 
     @filter.permission_type(filter.PermissionType.ADMIN)
     @filter.command("批量撤回")
+    @_stop_command_event
     async def batch_recall_command(self, event: AstrMessageEvent):
         """
         批量撤回消息:
@@ -960,6 +980,7 @@ class BatchRecall(Star):
 
     @filter.permission_type(filter.PermissionType.ADMIN)
     @filter.command("撤回")
+    @_stop_command_event
     async def recall_reply_command(self, event: AstrMessageEvent):
         """
         撤回引用的消息:引用一条消息并发送「撤回」
