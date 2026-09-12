@@ -328,7 +328,6 @@ class BatchRecall(Star):
                 self._no_auto_recall_count -= 1
 
             original_chain = result.chain.copy()
-            result.chain.clear()
             message_chain = MessageChain(chain=original_chain)
             onebot_messages = await AiocqhttpMessageEvent._parse_onebot_json(
                 message_chain,
@@ -356,6 +355,12 @@ class BatchRecall(Star):
             except Exception as send_exc:
                 logger.error(f"发送消息失败: {send_exc}")
                 return
+
+            # This path sends through OneBot directly instead of AstrMessageEvent.send().
+            # Keep AstrBot's send-operation state in sync so ProcessStage does not issue
+            # a second default LLM reply for the same event.
+            event._has_send_oper = True
+            result.chain.clear()
 
             message_id = None
             if isinstance(send_result, dict):
