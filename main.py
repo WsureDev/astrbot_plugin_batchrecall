@@ -263,7 +263,7 @@ class BatchRecall(Star):
             except Exception as exc:
                 logger.error(f"撤回机器人消息失败, message_id={message_id}: {exc}")
 
-        yield event.plain_result(f"已尝试撤回机器人最近 {success} 条消息。")
+        # yield event.plain_result(f"已尝试撤回机器人最近 {success} 条消息。")
         # 阻止后续 handler 和 LLM 处理
         event.stop_event()
 
