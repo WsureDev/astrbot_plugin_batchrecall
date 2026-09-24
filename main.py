@@ -9,6 +9,7 @@
 import asyncio
 import re
 import time
+from functools import wraps
 from typing import Optional
 
 from aiocqhttp.exceptions import ActionFailed
@@ -21,6 +22,25 @@ from astrbot.core.message.message_event_result import MessageChain
 from astrbot.core.platform.sources.aiocqhttp.aiocqhttp_message_event import (
     AiocqhttpMessageEvent,
 )
+from astrbot.core.star.filter.command import CommandFilter
+from astrbot.core.star.filter.command_group import CommandGroupFilter
+
+
+def _finish_command(handler):
+    """禁用已匹配指令的默认 LLM 回退，并在回复发送后终止事件。"""
+
+    @wraps(handler)
+    async def wrapped(self, event, *args, **kwargs):
+        # AstrBot 的这个参数实际表示“禁止默认 LLM 请求”，True 才是禁用。
+        # 此标记独立于 result，旧版框架 clear_result() 后仍然有效。
+        event.should_call_llm(True)
+        try:
+            async for result in handler(self, event, *args, **kwargs):
+                yield result
+        finally:
+            event.stop_event()
+
+    return wrapped
 
 
 class BatchRecall(Star):
@@ -202,12 +222,22 @@ class BatchRecall(Star):
             return False
         return self.conf.get("enable_group_recall", True)
 
-    @filter.platform_adapter_type(filter.PlatformAdapterType.ALL)
+    @filter.platform_adapter_type(filter.PlatformAdapterType.AIOCQHTTP)
     async def on_message(self, event: AstrMessageEvent):
         """监听所有收到的消息，记录到历史中；同时处理引用撤回的fallback"""
         try:
             if not isinstance(event, AiocqhttpMessageEvent):
                 return
+
+            # 使用框架已经匹配的指令，包含其他插件的指令、别名和子指令。
+            # 不终止事件，让对应插件正常执行；显式 request_llm 仍由框架处理。
+            # 普通聊天/未匹配的前缀消息不受影响。
+            if any(
+                isinstance(f, (CommandFilter, CommandGroupFilter))
+                for handler in event.get_extra("activated_handlers", [])
+                for f in handler.event_filters
+            ):
+                event.should_call_llm(True)
 
             # 只记录群消息
             if not event.get_group_id():
@@ -231,6 +261,7 @@ class BatchRecall(Star):
                         has_recall_text = True
 
             if reply_id and has_recall_text:
+                event.should_call_llm(True)
                 logger.info(f"[DEBUG-撤回-fallback] 检测到引用撤回, reply_id={reply_id}")
                 # 权限检查：优先用 event.is_admin()，回退用 raw_event 中的 role 字段
                 is_admin = False
@@ -247,6 +278,7 @@ class BatchRecall(Star):
                 if not is_admin:
                     self._mark_no_auto_recall()
                     yield event.plain_result("撤回命令仅管理员可使用。")
+                    event.stop_event()
                     return
                 session_id = self._get_session_id(event)
                 ok, err = await self._do_recall(event.bot, reply_id)
@@ -313,7 +345,6 @@ class BatchRecall(Star):
                 self._no_auto_recall_count -= 1
 
             original_chain = result.chain.copy()
-            result.chain.clear()
             message_chain = MessageChain(chain=original_chain)
             onebot_messages = await AiocqhttpMessageEvent._parse_onebot_json(
                 message_chain,
@@ -341,6 +372,11 @@ class BatchRecall(Star):
             except Exception as send_exc:
                 logger.error(f"发送消息失败: {send_exc}")
                 return
+
+            # 直接调用 OneBot 绕过了 event.send()，需同步框架的发送状态。
+            # 成功后再清空，失败时保留消息链交由框架正常发送。
+            event._has_send_oper = True
+            result.chain.clear()
 
             message_id = None
             if isinstance(send_result, dict):
@@ -385,12 +421,14 @@ class BatchRecall(Star):
             return False, f"撤回失败: {str(e)}"
 
     @filter.command("test_recall")
+    @_finish_command
     async def test_recall_command(self, event: AstrMessageEvent):
         """测试撤回功能（此测试消息会被记录并自动撤回，不标记为指令回复）"""
         recall_time = self.conf["recall_time"]
         yield event.plain_result(f"🧪 测试消息，{recall_time}秒后此消息将会撤回...")
 
     @filter.command("recall_config")
+    @_finish_command
     async def recall_config_command(self, event: AstrMessageEvent):
         """查看当前配置"""
         self._mark_no_auto_recall()
@@ -463,6 +501,7 @@ class BatchRecall(Star):
 
     @filter.permission_type(filter.PermissionType.ADMIN)
     @filter.command("消息列表")
+    @_finish_command
     async def message_list_command(self, event: AstrMessageEvent):
         """
         显示最近消息列表:消息列表 [显示数量]
@@ -552,6 +591,7 @@ class BatchRecall(Star):
 
     @filter.permission_type(filter.PermissionType.ADMIN)
     @filter.command("撤回自身")
+    @_finish_command
     async def recall_bot_messages_command(self, event: AstrMessageEvent):
         """
         撤回机器人自身发送的消息:撤回自身 撤回数量
@@ -680,6 +720,7 @@ class BatchRecall(Star):
 
     @filter.permission_type(filter.PermissionType.ADMIN)
     @filter.command("批量撤回")
+    @_finish_command
     async def batch_recall_command(self, event: AstrMessageEvent):
         """
         批量撤回消息:
@@ -963,6 +1004,7 @@ class BatchRecall(Star):
 
     @filter.permission_type(filter.PermissionType.ADMIN)
     @filter.command("撤回")
+    @_finish_command
     async def recall_reply_command(self, event: AstrMessageEvent):
         """
         撤回引用的消息:引用一条消息并发送「撤回」
