@@ -205,6 +205,10 @@ async def collect(handler, event):
     return [result async for result in handler(event)]
 
 
+async def stalled_api(*args, **kwargs):
+    await asyncio.Event().wait()
+
+
 def metadata(handler, command=False):
     return SimpleNamespace(
         handler=handler,
@@ -311,6 +315,170 @@ class PluginTests(unittest.IsolatedAsyncioTestCase):
         await asyncio.gather(*p.recall_tasks)
         event.bot.delete_msg.assert_awaited_once_with(message_id=901)
 
+    async def test_reply_is_handled_once_even_if_stop_state_is_cleared(self):
+        for notification in (True, False):
+            for first, second in (
+                ("on_message", "recall_reply_command"),
+                ("recall_reply_command", "on_message"),
+            ):
+                with self.subTest(notification=notification, first=first):
+                    p = plugin(notification)
+                    event = QQEvent("撤回", messages=[Reply(11), Plain("撤回")])
+                    results = await collect(getattr(p, first), event)
+                    event.clear_result()  # 旧框架在两个处理器之间清除停止状态。
+                    results += await collect(getattr(p, second), event)
+                    event.bot.delete_msg.assert_awaited_once_with(message_id=11)
+                    self.assertEqual(len(results), int(notification))
+
+    async def test_reply_fallback_matches_complete_plain_text(self):
+        for parts, expected in (
+            ([" /撤", "回 "], 1),
+            (["撤回", "是什么意思"], 0),
+            (["撤回", "自身 1"], 0),
+        ):
+            with self.subTest(parts=parts):
+                event = QQEvent(messages=[Reply(11), At(100)] + [Plain(t) for t in parts])
+                await collect(plugin().on_message, event)
+                self.assertEqual(event.bot.delete_msg.await_count, expected)
+
+    async def test_failed_reply_keeps_message_for_retry(self):
+        for handler in ("on_message", "recall_reply_command", "batch_recall_command"):
+            with self.subTest(handler=handler):
+                p = plugin()
+                history = [(11, "消息", 0, "100", "机器人", True)]
+                p.message_history["123"] = history.copy()
+                event = QQEvent("撤回", messages=[Reply(11), Plain("撤回")])
+                event.bot.delete_msg.side_effect = RuntimeError("协议端错误")
+                await collect(getattr(p, handler), event)
+                self.assertEqual(p.message_history["123"], history)
+
+    async def test_stalled_reply_finishes_and_next_self_recall_still_works(self):
+        for notification in (True, False):
+            for handler in ("on_message", "recall_reply_command", "batch_recall_command"):
+                with self.subTest(notification=notification, handler=handler):
+                    p = plugin(notification)
+                    p.conf["api_timeout"] = 0.01
+                    history = [(11, "消息", 0, "100", "机器人", True)]
+                    p.message_history["123"] = history.copy()
+                    event = QQEvent("撤回", messages=[Reply(11), Plain("撤回")])
+                    cancelled = asyncio.Event()
+
+                    async def stalled(**kwargs):
+                        try:
+                            await asyncio.Event().wait()
+                        finally:
+                            cancelled.set()
+
+                    event.bot.delete_msg.side_effect = stalled
+                    results = await asyncio.wait_for(
+                        collect(getattr(p, handler), event), timeout=0.3
+                    )
+                    self.assertTrue(cancelled.is_set())
+                    self.assertTrue(event.is_stopped())
+                    self.assertTrue(event.call_llm)
+                    self.assertEqual(len(results), int(notification))
+                    if notification:
+                        self.assertIn("超时", results[0].chain[0].text)
+                    self.assertEqual(p.message_history["123"], history)
+
+                    next_event = QQEvent("撤回自身 1")
+                    next_event.bot = event.bot
+                    next_event.bot.delete_msg.side_effect = None
+                    await asyncio.wait_for(
+                        collect(p.recall_bot_messages_command, next_event), timeout=0.3
+                    )
+                    self.assertEqual(next_event.bot.delete_msg.await_count, 2)
+                    self.assertEqual(p.message_history["123"], [])
+                    self.assertTrue(next_event.is_stopped())
+
+    async def test_stalled_batch_stops_at_first_timeout(self):
+        for handler, text, messages in (
+            ("recall_bot_messages_command", "撤回自身 2", None),
+            ("batch_recall_command", "批量撤回 2", None),
+            ("batch_recall_command", "批量撤回 1,2", None),
+            ("batch_recall_command", "批量撤回 1,2", [Plain("批量撤回 1,2"), At(100)]),
+        ):
+            with self.subTest(handler=handler, text=text, messages=messages):
+                p = plugin()
+                p.conf["api_timeout"] = 0.01
+                history = [
+                    (11, "消息1", 0, "100", "机器人", True),
+                    (12, "消息2", 0, "100", "机器人", True),
+                ]
+                p.message_history["123"] = history.copy()
+                event = QQEvent(text, messages=messages)
+                event.bot.delete_msg.side_effect = stalled_api
+                results = await asyncio.wait_for(
+                    collect(getattr(p, handler), event), timeout=0.3
+                )
+                event.bot.delete_msg.assert_awaited_once_with(message_id=11)
+                self.assertEqual(p.message_history["123"], history)
+                self.assertIn("超时", results[0].chain[0].text)
+                self.assertTrue(event.is_stopped())
+
+    async def test_stalled_send_is_not_retried_by_framework(self):
+        for group in ("123", ""):
+            with self.subTest(group=group):
+                p = plugin()
+                p.conf["api_timeout"] = 0.01
+                event = QQEvent(group=group)
+                event.set_result(event.plain_result("撤回结果"))
+                event.bot.call_action.side_effect = stalled_api
+                await asyncio.wait_for(p.intercept_and_recall(event), timeout=0.3)
+                self.assertTrue(event._has_send_oper)
+                self.assertEqual(event.get_result().chain, [])
+                self.assertEqual(p.message_history, {})
+                self.assertEqual(p.recall_tasks, set())
+                event.bot.call_action.assert_awaited_once()
+
+                next_event = QQEvent(group=group)
+                next_event.bot = event.bot
+                next_event.bot.call_action.side_effect = None
+                next_event.set_result(next_event.plain_result("后续回复"))
+                await p.intercept_and_recall(next_event)
+                self.assertTrue(next_event._has_send_oper)
+                session = group or "42"
+                self.assertEqual(p.message_history[session][0][0], 901)
+
+    async def test_stalled_history_queries_finish_without_deleting(self):
+        for handler, text in (
+            ("message_list_command", "消息列表"),
+            ("recall_bot_messages_command", "撤回自身 1"),
+            ("batch_recall_command", "批量撤回 1"),
+        ):
+            for cached in (False, True):
+                with self.subTest(handler=handler, cached=cached):
+                    p = plugin()
+                    p.conf["api_timeout"] = 0.01
+                    if cached:
+                        p.message_history["123"] = [(12, "用户消息", 0, "42", "用户", False)]
+                    event = QQEvent(text)
+                    event.bot.call_action.side_effect = stalled_api
+                    await asyncio.wait_for(collect(getattr(p, handler), event), timeout=0.3)
+                    self.assertTrue(event.is_stopped())
+                    self.assertTrue(event.call_llm)
+                    if handler != "batch_recall_command" or not cached:
+                        event.bot.delete_msg.assert_not_awaited()
+
+    async def test_stalled_automatic_recall_finishes_and_unload_cancels_tasks(self):
+        for unload in (False, True):
+            with self.subTest(unload=unload):
+                p = plugin()
+                p.conf.update(enable_group_recall=True, recall_time=0, api_timeout=0.01)
+                event = QQEvent()
+                event.bot.delete_msg.side_effect = stalled_api
+                event.set_result(event.plain_result("自动撤回的消息"))
+                await p.intercept_and_recall(event)
+                tasks = list(p.recall_tasks)
+                self.assertEqual(len(tasks), 1)
+                if unload:
+                    await asyncio.wait_for(p.terminate(), timeout=0.3)
+                    self.assertTrue(tasks[0].cancelled())
+                else:
+                    await asyncio.wait_for(asyncio.gather(*tasks), timeout=0.3)
+                self.assertEqual(p.recall_tasks, set())
+                self.assertEqual(p.message_history["123"][0][0], 901)
+
 
 def load_framework(ref):
     """执行上游原始方法体，只替换外部依赖，避免安装完整服务及 LLM SDK。"""
@@ -379,6 +547,9 @@ class FrameworkTests(unittest.IsolatedAsyncioTestCase):
                 "chat",
                 "silent_recall",
                 "recall_help",
+                "reply_recall",
+                "reply_notification",
+                "reply_timeout",
             ):
                 for listener_first in (True, False):
                     with self.subTest(
@@ -421,6 +592,13 @@ class FrameworkTests(unittest.IsolatedAsyncioTestCase):
                             handlers.append(metadata(p.batch_recall_command, True))
                         elif scenario == "recall_help":
                             handlers.append(metadata(p.recall_reply_command, True))
+                        elif scenario.startswith("reply_"):
+                            event.messages = [Reply(11), Plain("撤回")]
+                            p.conf["enable_recall_notification"] = scenario == "reply_notification"
+                            if scenario == "reply_timeout":
+                                p.conf["api_timeout"] = 0.01
+                                event.bot.delete_msg.side_effect = stalled_api
+                            handlers.append(metadata(p.recall_reply_command, True))
                         if not listener_first:
                             handlers.reverse()
                         event.set_extra("activated_handlers", handlers)
@@ -456,11 +634,16 @@ class FrameworkTests(unittest.IsolatedAsyncioTestCase):
                             "external_reply",
                             "external_regex_reply",
                             "recall_help",
+                            "reply_notification",
                         ):
                             event.bot.call_action.assert_awaited_once()
                         if scenario == "silent_recall":
                             event.bot.delete_msg.assert_awaited_once_with(message_id=11)
                             event.bot.call_action.assert_not_awaited()
+                        if scenario.startswith("reply_"):
+                            event.bot.delete_msg.assert_awaited_once_with(message_id=11)
+                            if scenario != "reply_notification":
+                                event.bot.call_action.assert_not_awaited()
 
 
 if __name__ == "__main__":

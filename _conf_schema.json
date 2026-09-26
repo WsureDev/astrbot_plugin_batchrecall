@@ -1,4 +1,10 @@
 {
+    "api_timeout": {
+        "description": "协议请求超时",
+        "type": "int",
+        "hint": "本插件调用撤回、读取历史和发送消息接口时的最大等待秒数，必须为正数；超时后结束等待，保留未确认撤回的记录",
+        "default": 10
+    },
     "recall_time": {
         "description": "撤回时间",
         "type": "int",
