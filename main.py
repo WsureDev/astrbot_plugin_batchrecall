@@ -22,13 +22,18 @@ from astrbot.core.message.message_event_result import MessageChain
 from astrbot.core.platform.sources.aiocqhttp.aiocqhttp_message_event import (
     AiocqhttpMessageEvent,
 )
+from astrbot.core.star.filter.command import CommandFilter
+from astrbot.core.star.filter.command_group import CommandGroupFilter
 
 
-def _stop_command_event(handler):
-    """Stop command events after the handler has finished processing."""
+def _finish_command(handler):
+    """禁用已匹配指令的默认 LLM 回退，并在回复发送后终止事件。"""
 
     @wraps(handler)
     async def wrapped(self, event, *args, **kwargs):
+        # AstrBot 的这个参数实际表示“禁止默认 LLM 请求”，True 才是禁用。
+        # 此标记独立于 result，旧版框架 clear_result() 后仍然有效。
+        event.should_call_llm(True)
         try:
             async for result in handler(self, event, *args, **kwargs):
                 yield result
@@ -40,6 +45,8 @@ def _stop_command_event(handler):
 
 class BatchRecall(Star):
     """批量撤回插件主类"""
+
+    _RECALL_TIMEOUT_ERROR = "撤回请求超时，协议端未及时响应，请稍后重试"
 
     def __init__(self, context: Context, config):
         super().__init__(context)
@@ -188,7 +195,10 @@ class BatchRecall(Star):
         await asyncio.sleep(recall_time)
         try:
             if message_id and message_id != 0:
-                await client.delete_msg(message_id=message_id)
+                await self._call_api(
+                    client.delete_msg(message_id=message_id),
+                    f"delete_msg message_id={message_id}",
+                )
                 logger.info(f"✅ 已自动撤回消息: {message_id}")
                 if session_id:
                     self._remove_message_from_history(session_id, message_id)
@@ -217,12 +227,22 @@ class BatchRecall(Star):
             return False
         return self.conf.get("enable_group_recall", True)
 
-    @filter.platform_adapter_type(filter.PlatformAdapterType.ALL)
+    @filter.platform_adapter_type(filter.PlatformAdapterType.AIOCQHTTP)
     async def on_message(self, event: AstrMessageEvent):
         """监听所有收到的消息，记录到历史中；同时处理引用撤回的fallback"""
         try:
             if not isinstance(event, AiocqhttpMessageEvent):
                 return
+
+            # 使用框架已经匹配的指令，包含其他插件的指令、别名和子指令。
+            # 不终止事件，让对应插件正常执行；显式 request_llm 仍由框架处理。
+            # 普通聊天/未匹配的前缀消息不受影响。
+            if any(
+                isinstance(f, (CommandFilter, CommandGroupFilter))
+                for handler in event.get_extra("activated_handlers", [])
+                for f in handler.event_filters
+            ):
+                event.should_call_llm(True)
 
             # 只记录群消息
             if not event.get_group_id():
@@ -235,17 +255,17 @@ class BatchRecall(Star):
             # 检测消息是否包含 Reply 段 + 文本为"撤回"（可能带命令前缀）
             messages = event.get_messages()
             reply_id = None
-            has_recall_text = False
+            has_recall_text = (
+                self._strip_command_prefix(self._extract_text_from_plain_segments(event))
+                == "撤回"
+            )
             for segment in messages:
                 if isinstance(segment, Reply):
                     reply_id = int(segment.id)
-                elif isinstance(segment, Plain):
-                    # 剥离开头的命令前缀符号后检查是否为"撤回"
-                    stripped = segment.text.strip().lstrip("/.!#$%^&*~-+=?，。、 ")
-                    if stripped == "撤回":
-                        has_recall_text = True
+                    break
 
             if reply_id and has_recall_text:
+                event.should_call_llm(True)
                 logger.info(f"[DEBUG-撤回-fallback] 检测到引用撤回, reply_id={reply_id}")
                 # 权限检查：优先用 event.is_admin()，回退用 raw_event 中的 role 字段
                 is_admin = False
@@ -262,18 +282,10 @@ class BatchRecall(Star):
                 if not is_admin:
                     self._mark_no_auto_recall()
                     yield event.plain_result("撤回命令仅管理员可使用。")
+                    event.stop_event()
                     return
-                session_id = self._get_session_id(event)
-                ok, err = await self._do_recall(event.bot, reply_id)
-                self._remove_message_from_history(session_id, reply_id)
-                if self.conf.get("enable_recall_notification", True):
-                    self._mark_no_auto_recall()
-                    if ok:
-                        logger.info(f"[DEBUG-撤回-fallback] 撤回成功, reply_id={reply_id}")
-                        yield event.plain_result("✅ 已撤回引用的消息。")
-                    else:
-                        logger.info(f"[DEBUG-撤回-fallback] 撤回失败: {err}")
-                        yield event.plain_result(f"❌ {err}\n提示：机器人需要管理员权限才能撤回他人消息，且消息需在2分钟内")
+                async for result in self._recall_reply(event, reply_id):
+                    yield result
                 event.stop_event()
                 return
             # ===== 引用撤回 fallback 结束 =====
@@ -341,24 +353,35 @@ class BatchRecall(Star):
 
             try:
                 if is_group:
-                    send_result = await event.bot.call_action(
+                    send_result = await self._call_api(
+                        event.bot.call_action(
+                            "send_group_msg",
+                            group_id=int(session_id),
+                            message=onebot_messages,
+                        ),
                         "send_group_msg",
-                        group_id=int(session_id),
-                        message=onebot_messages,
                     )
                 else:
-                    send_result = await event.bot.call_action(
+                    send_result = await self._call_api(
+                        event.bot.call_action(
+                            "send_private_msg",
+                            user_id=int(session_id),
+                            message=onebot_messages,
+                        ),
                         "send_private_msg",
-                        user_id=int(session_id),
-                        message=onebot_messages,
                     )
+            except asyncio.TimeoutError:
+                # 请求可能已送达；不能交回框架重发，否则会再次长时间等待或重复发送。
+                event._has_send_oper = True
+                result.chain.clear()
+                logger.error("发送消息超时，发送结果未知，本次不再重复发送。")
+                return
             except Exception as send_exc:
                 logger.error(f"发送消息失败: {send_exc}")
                 return
 
-            # This path sends through OneBot directly instead of AstrMessageEvent.send().
-            # Keep AstrBot's send-operation state in sync so ProcessStage does not issue
-            # a second default LLM reply for the same event.
+            # 直接调用 OneBot 绕过了 event.send()，需同步框架的发送状态。
+            # 成功后再清空，失败时保留消息链交由框架正常发送。
             event._has_send_oper = True
             result.chain.clear()
 
@@ -392,32 +415,72 @@ class BatchRecall(Star):
         except Exception as e:
             logger.error(f"消息拦截处理失败: {e}")
 
+    async def _call_api(self, request, action: str):
+        """限制本插件的协议请求等待时间，不修改共享 OneBot 客户端配置。"""
+        timeout = self.conf.get("api_timeout", 10)
+        if not isinstance(timeout, (int, float)) or timeout <= 0:
+            timeout = 10
+        try:
+            return await asyncio.wait_for(request, timeout=timeout)
+        except asyncio.TimeoutError:
+            logger.warning(f"OneBot API 超时: {action}, 等待上限 {timeout} 秒")
+            raise
+
     async def _do_recall(self, bot, message_id: int) -> tuple[bool, str]:
         """执行撤回操作，返回(是否成功, 错误信息)"""
         try:
-            await bot.delete_msg(message_id=message_id)
+            await self._call_api(
+                bot.delete_msg(message_id=message_id),
+                f"delete_msg message_id={message_id}",
+            )
             return True, ""
+        except asyncio.TimeoutError:
+            return False, self._RECALL_TIMEOUT_ERROR
         except ActionFailed as e:
-            if getattr(e, "retcode", None) == 1200:
+            retcode = getattr(e, "retcode", None)
+            logger.warning(f"撤回消息失败: message_id={message_id}, retcode={retcode}")
+            if retcode == 1200:
                 return False, "消息已撤回或超时"
-            return False, f"撤回失败(retcode={e.retcode})"
+            return False, f"撤回失败(retcode={retcode})"
         except Exception as e:
+            logger.warning(f"撤回消息失败: message_id={message_id}, {e}")
             return False, f"撤回失败: {str(e)}"
 
+    @_finish_command
+    async def _recall_reply(self, event: AiocqhttpMessageEvent, reply_id: int):
+        """三个引用撤回入口共用处理结果，避免旧框架清除 STOP 后重复撤回。"""
+        if event.get_extra("batchrecall_reply_handled", False):
+            return
+        # 在第一次 await 前占用当前事件；标记不与其他消息或群聊共享。
+        event.set_extra("batchrecall_reply_handled", True)
+        ok, err = await self._do_recall(event.bot, reply_id)
+        if ok:
+            self._remove_message_from_history(self._get_session_id(event), reply_id)
+        if self.conf.get("enable_recall_notification", True):
+            self._mark_no_auto_recall()
+            if ok:
+                yield event.plain_result("✅ 已撤回引用的消息。")
+            else:
+                text = f"❌ {err}"
+                if err != self._RECALL_TIMEOUT_ERROR:
+                    text += "\n提示：机器人需要管理员权限才能撤回他人消息。"
+                yield event.plain_result(text)
+
     @filter.command("test_recall")
-    @_stop_command_event
+    @_finish_command
     async def test_recall_command(self, event: AstrMessageEvent):
         """测试撤回功能（此测试消息会被记录并自动撤回，不标记为指令回复）"""
         recall_time = self.conf["recall_time"]
         yield event.plain_result(f"🧪 测试消息，{recall_time}秒后此消息将会撤回...")
 
     @filter.command("recall_config")
-    @_stop_command_event
+    @_finish_command
     async def recall_config_command(self, event: AstrMessageEvent):
         """查看当前配置"""
         self._mark_no_auto_recall()
         config_info = "📋 当前撤回配置:\n"
         config_info += f"撤回时间: {self.conf['recall_time']}秒\n"
+        config_info += f"协议请求超时: {self.conf.get('api_timeout', 10)}秒\n"
         config_info += f"私聊启用: {self.conf.get('enable_private_recall', True)}\n"
         config_info += f"群聊启用: {self.conf.get('enable_group_recall', True)}\n"
         config_info += f"撤回结果通知: {self.conf.get('enable_recall_notification', True)}\n"
@@ -450,7 +513,10 @@ class BatchRecall(Star):
                 "group_id": int(session_id),
                 "count": fetch_count,
             }
-            result = await event.bot.call_action("get_group_msg_history", **payloads)
+            result = await self._call_api(
+                event.bot.call_action("get_group_msg_history", **payloads),
+                "get_group_msg_history",
+            )
             history_messages = result.get("messages", []) if isinstance(result, dict) else []
 
             # 按时间倒序排列（最新在前）
@@ -485,7 +551,7 @@ class BatchRecall(Star):
 
     @filter.permission_type(filter.PermissionType.ADMIN)
     @filter.command("消息列表")
-    @_stop_command_event
+    @_finish_command
     async def message_list_command(self, event: AstrMessageEvent):
         """
         显示最近消息列表:消息列表 [显示数量]
@@ -575,7 +641,7 @@ class BatchRecall(Star):
 
     @filter.permission_type(filter.PermissionType.ADMIN)
     @filter.command("撤回自身")
-    @_stop_command_event
+    @_finish_command
     async def recall_bot_messages_command(self, event: AstrMessageEvent):
         """
         撤回机器人自身发送的消息:撤回自身 撤回数量
@@ -650,7 +716,10 @@ class BatchRecall(Star):
                     "group_id": int(group_id),
                     "count": fetch_count,
                 }
-                result = await event.bot.call_action("get_group_msg_history", **payloads)
+                result = await self._call_api(
+                    event.bot.call_action("get_group_msg_history", **payloads),
+                    "get_group_msg_history",
+                )
                 history_messages = result.get("messages", []) if isinstance(result, dict) else []
                 bot_self_id = str(event.get_self_id())
                 bot_messages_raw = [
@@ -673,6 +742,7 @@ class BatchRecall(Star):
             if self.conf.get("enable_recall_notification", True):
                 self._mark_no_auto_recall()
                 yield event.plain_result("未找到可撤回的机器人消息。")
+            event.stop_event()
             return
 
         success = 0
@@ -692,6 +762,8 @@ class BatchRecall(Star):
                     failed_msgs.append(f"{message_id}({err})")
                 else:
                     self._remove_message_from_history(session_id, message_id)
+                if err == self._RECALL_TIMEOUT_ERROR:
+                    break
 
         if self.conf.get("enable_recall_notification", True):
             result_text = f"已尝试撤回机器人最近 {success} 条消息。"
@@ -703,7 +775,7 @@ class BatchRecall(Star):
 
     @filter.permission_type(filter.PermissionType.ADMIN)
     @filter.command("批量撤回")
-    @_stop_command_event
+    @_finish_command
     async def batch_recall_command(self, event: AstrMessageEvent):
         """
         批量撤回消息:
@@ -780,14 +852,8 @@ class BatchRecall(Star):
 
         # 有引用消息时优先处理引用撤回
         if reply_id:
-            ok, err = await self._do_recall(event.bot, reply_id)
-            self._remove_message_from_history(session_id, reply_id)
-            if self.conf.get("enable_recall_notification", True):
-                self._mark_no_auto_recall()
-                if ok:
-                    yield event.plain_result(f"✅ 已撤回引用的消息。")
-                else:
-                    yield event.plain_result(f"❌ {err}")
+            async for result in self._recall_reply(event, reply_id):
+                yield result
             event.stop_event()
             return
 
@@ -867,6 +933,7 @@ class BatchRecall(Star):
                 if self.conf.get("enable_recall_notification", True):
                     self._mark_no_auto_recall()
                     yield event.plain_result("未找到可撤回的消息。")
+                event.stop_event()
                 return
 
             success = 0
@@ -886,6 +953,8 @@ class BatchRecall(Star):
                         failed_msgs.append(f"{message_id}({err})")
                     else:
                         self._remove_message_from_history(session_id, message_id)
+                    if err == self._RECALL_TIMEOUT_ERROR:
+                        break
 
             if self.conf.get("enable_recall_notification", True):
                 result_text = f"已尝试撤回最近 {success} 条消息。"
@@ -927,6 +996,8 @@ class BatchRecall(Star):
                                 failed_msgs.append(f"[{num}]{err}")
                             else:
                                 self._remove_message_from_history(session_id, msg_id)
+                            if err == self._RECALL_TIMEOUT_ERROR:
+                                break
                     else:
                         invalid_nums.append(str(num))
 
@@ -946,6 +1017,7 @@ class BatchRecall(Star):
                 if self.conf.get("enable_recall_notification", True):
                     self._mark_no_auto_recall()
                     yield event.plain_result("没有可撤回的消息记录，请先发送「消息列表」查看。")
+                event.stop_event()
                 return
 
             success = 0
@@ -969,6 +1041,8 @@ class BatchRecall(Star):
                             failed_msgs.append(f"[{num}]{err}")
                         else:
                             self._remove_message_from_history(session_id, msg_id)
+                        if err == self._RECALL_TIMEOUT_ERROR:
+                            break
                 else:
                     invalid_nums.append(str(num))
 
@@ -985,7 +1059,7 @@ class BatchRecall(Star):
 
     @filter.permission_type(filter.PermissionType.ADMIN)
     @filter.command("撤回")
-    @_stop_command_event
+    @_finish_command
     async def recall_reply_command(self, event: AstrMessageEvent):
         """
         撤回引用的消息:引用一条消息并发送「撤回」
@@ -1019,16 +1093,6 @@ class BatchRecall(Star):
             )
             return
 
-        session_id = self._get_session_id(event)
-        ok, err = await self._do_recall(event.bot, reply_id)
-        self._remove_message_from_history(session_id, reply_id)
-
-        if self.conf.get("enable_recall_notification", True):
-            self._mark_no_auto_recall()
-            if ok:
-                logger.info(f"[DEBUG-撤回] 撤回成功, reply_id={reply_id}")
-                yield event.plain_result("✅ 已撤回引用的消息。")
-            else:
-                logger.info(f"[DEBUG-撤回] 撤回失败: {err}")
-                yield event.plain_result(f"❌ {err}\n提示：机器人需要管理员权限才能撤回他人消息，且消息需在2分钟内")
+        async for result in self._recall_reply(event, reply_id):
+            yield result
         event.stop_event()

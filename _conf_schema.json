@@ -1,4 +1,10 @@
 {
+    "api_timeout": {
+        "description": "协议请求超时",
+        "type": "int",
+        "hint": "本插件调用撤回、读取历史和发送消息接口时的最大等待秒数，必须为正数；超时后结束等待，保留未确认撤回的记录",
+        "default": 10
+    },
     "recall_time": {
         "description": "撤回时间",
         "type": "int",
@@ -38,7 +44,7 @@
     "enable_recall_notification": {
         "description": "撤回结果通知",
         "type": "bool",
-        "hint": "是否在撤回完成后返回结果通知消息",
+        "hint": "关闭后，批量撤回、撤回自身和引用撤回不发送结果通知，也不会触发默认 LLM 回复；使用方法和权限等提示仍保留",
         "default": true
     },
     "max_message_history": {
