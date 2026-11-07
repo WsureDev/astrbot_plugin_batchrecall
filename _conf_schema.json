@@ -1,4 +1,10 @@
 {
+    "confirmation_timeout": {
+        "description": "撤回确认等待时间",
+        "type": "int",
+        "hint": "撤回接口返回后等待平台撤回通知的秒数。未确认时记录 warning、保留历史并结束本批次；群聊静默设置继续生效。",
+        "default": 2
+    },
     "api_timeout": {
         "description": "协议请求超时",
         "type": "int",
@@ -14,7 +20,7 @@
     "enable_private_recall": {
         "description": "启用私聊撤回",
         "type": "bool",
-        "hint": "是否在私聊中启用撤回功能",
+        "hint": "控制机器人私聊回复的自动撤回；管理员私聊另有开关",
         "default": true
     },
     "enable_admin_private_recall": {
@@ -26,13 +32,13 @@
     "enable_group_recall": {
         "description": "启用群聊撤回",
         "type": "bool",
-        "hint": "是否在群聊中启用撤回功能",
+        "hint": "控制机器人群聊回复的自动撤回；手动指令独立执行",
         "default": true
     },
     "group_whitelist": {
         "description": "白名单群聊",
         "type": "list",
-        "hint": "只有在此列表中的群聊才能使用撤回功能，留空表示所有群聊都可用",
+        "hint": "仅控制哪些群启用自动撤回，留空表示全部群；不限制手动撤回指令",
         "default": []
     },
     "batch_max_count": {
@@ -50,7 +56,7 @@
     "max_message_history": {
         "description": "消息记录最大条数",
         "type": "int",
-        "hint": "每个会话最多记录多少条机器人消息用于编号撤回",
+        "hint": "每个渠道缓存的用户和机器人消息条数；编号固定绑定消息列表展示快照",
         "default": 50
     }
 }

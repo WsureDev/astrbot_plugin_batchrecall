@@ -1,75 +1,71 @@
-<div align="center">
+# 批量撤回
 
-![:shell](https://count.getloli.com/@github_monitor_shell?name=github_monitor_shell&theme=minecraft&padding=7&offset=0&align=top&scale=1&pixelated=1&darkmode=auto)
+QQ OneBot 撤回插件，支持引用撤回、按数量撤回、按消息列表编号撤回、撤回机器人自身消息和自动撤回。
 
+## 发送与 TTS
 
-[![License](https://img.shields.io/badge/License-MIT-green.svg)](https://opensource.org/licenses/MIT)
-[![Python 3.10+](https://img.shields.io/badge/Python-3.10%2B-blue.svg)](https://www.python.org/)
-[![AstrBot](https://img.shields.io/badge/AstrBot-3.4%2B-orange.svg)](https://github.com/Soulter/AstrBot)
-[![GitHub](https://img.shields.io/badge/作者-Shell-blue)](https://github.com/1592363624)
+插件通过 OneBot 客户端的正常发送回执记录消息 ID，随后安排自动撤回。正文由 AstrBot 原生流程发送，插件不会在回复装饰阶段抢先发送、清空消息链或重试发送。
 
-</div>
+兼容 astrbot_plugin_gsvi_short_tts：模型回复经过其发送入口转成语音后，撤回插件记录实际语音消息的 ID。未命中 TTS、超长、图文或合成失败时，继续记录平台实际发送的消息。工具和后台主动发送也按实际目标渠道处理。
 
-## 指令列表
+需要由渠道短文本插件独立控制音色、字数和概率时，请关闭对应 AstrBot 配置档的原生自动 TTS。两者是各自独立的语音规则。
 
-- **批量撤回**：批量撤回最近的消息
-  - 格式：批量撤回 @用户 撤回数量 (撤回指定用户消息)
-  - 格式：批量撤回 撤回数量 (倒序撤回消息)
+## 指令
 
-## 静默撤回
+以下指令需结合 AstrBot 的唤醒前缀使用；引用消息后直接发送“撤回”也有群聊识别入口。
 
-在插件配置中关闭 **撤回结果通知**（`enable_recall_notification=false`），保存并重载插件。
-批量撤回、按编号撤回、撤回自身、引用撤回完成后将不发送结果通知，也不会转入默认 LLM 回复。
-此开关同时关闭撤回失败的结果通知；参数用法、平台限制和权限提示仍然保留。
-自动撤回本身不会发送撤回成功通知。
+| 指令 | 行为 |
+| --- | --- |
+| 引用消息＋撤回 | 撤回被引用的消息 |
+| 消息列表 10 | 展示最近消息和固定编号 |
+| 批量撤回 2, | 撤回该用户最后一次消息列表中的第 2 项 |
+| 批量撤回 2 4 | 撤回该列表的第 2、4 项 |
+| 批量撤回 @用户 1 3 | 按该列表中指定用户的顺序，撤回第 1、3 项 |
+| 批量撤回 5 | 请求撤回当前最近 5 条消息 |
+| 撤回自身 5 | 请求撤回机器人当前最近 5 条消息 |
+| recall_config | 查看配置 |
+| test_recall | 发送可自动撤回的测试消息 |
 
-## 指令与 LLM 流程
+数量必须为正整数。单个数字表示数量；按单个编号操作时加逗号，例如“批量撤回 2,”。
 
-本分支基于上游 `v1.1.2`（`b3bb6cd`）修复以下问题：
+编号绑定到该发送者在该会话中最后一次成功发出的消息列表。新消息和撤回通知不会改变旧列表的编号；另一用户需要先查看自己的列表。重载后重新发送“消息列表”。历史按平台实例、群聊／私聊和收件目标分别保存。
 
-- 通过 OneBot 直接发送回复后同步 AstrBot 的发送状态，避免其他插件的回复再次触发 LLM；发送失败时保留原消息链供框架发送。
-- 对 QQ 上框架已匹配的指令（包括其他插件的指令、别名、子指令）禁止默认 LLM 回退。指令处理器正常执行，插件显式发起的 LLM 请求继续有效。
-- 本插件指令和引用撤回 fallback 在静默、参数错误等路径也禁止默认 LLM 回退。普通聊天和未匹配的前缀消息保持原行为。
+## 自动撤回与静默
 
-AstrBot 的 `should_call_llm(True)` 实际设置的是“禁止默认 LLM 请求”标记。
-它独立于消息结果对象，避免旧版框架 `clear_result()` 清除 `stop_event()` 的状态后再次触发 LLM。
-仅修补 `_has_send_oper` 无法覆盖未发送消息的指令。
+“启用群聊撤回”“启用私聊撤回”和群白名单管理自动撤回；手动撤回指令独立执行。指令回执使用事件级豁免标记，其他群聊和并发回复不受影响。
 
-## 引用撤回与请求超时（v1.1.3）
+关闭“撤回结果通知”后，手动撤回的成功、失败和未确认结果均不发送群聊回执，且不会触发默认 LLM 回复；参数用法和权限提示保留。
 
-- 引用撤回的命令入口和消息监听入口共享事件标记，同一条指令只撤回一次；旧版 AstrBot 清除停止状态后也不会重复调用。
-- 引用撤回失败或请求超时时，保留本地消息记录，后续仍可通过引用、编号或「撤回自身」重试。
-- 新增 **协议请求超时**（`api_timeout`，默认 10 秒），用于本插件的撤回、历史查询和发送请求。批量撤回遇到请求超时立即结束本批次，避免逐条累积等待；静默模式仍不发送通知，但会记录超时接口和消息 ID。
-- 发送请求超时表示发送结果未知，本次不再交给框架重复发送；明确返回发送失败时仍保留原消息链供框架处理。
-- 引用指令按拼接后的完整文本匹配，支持文本分段，避免把「撤回是什么意思」等普通聊天误判成撤回。
+LLM 运行期间，引用撤回仍由正常插件调度处理，不获取 LLM 会话锁、不停止正在运行的模型。
 
-更新后重载插件即可使用默认超时。若协议端响应较慢，可在插件配置中调整 `api_timeout`。
-此超时只覆盖进入插件后的调用；若日志尚未出现插件的引用撤回记录，却先出现框架的 `get_msg` /「获取引用消息失败」，需进一步排查 AstrBot 解析引用消息及协议端响应。
+## 撤回确认与日志
 
-## 回归验证
+接口调用使用“协议请求超时”（默认 10 秒）；接口接受请求后，等待“撤回确认等待时间”（默认 2 秒）内的 group_recall 或 friend_recall 通知。通知在 OneBot 客户端直接监听，独立于框架的自消息忽略设置。
 
-运行插件测试（只需 Python 标准库）：
+筛选官方日志中的 [BatchRecall]：
+
+- recall_api_accepted：接口接受请求。
+- recall_confirmed／recall_notice_confirmed：收到相同消息 ID 的撤回通知。
+- recall_failed：协议返回失败，记录返回码和错误详情。
+- recall_unconfirmed：接口接受后仍未收到确认，保留历史并结束本批次。
+
+未确认时不会自动重发，不能仅据此判断 QQ 消息是否已经撤回。静默配置只影响群聊回执，后台诊断日志继续记录。明确失败和超时同样保留可重试的历史记录。
+
+## 验证
+
+只使用标准库、内存平台接口和临时 WAV，无数据库测试，不连接 QQ 或在线 TTS：
 
 ```sh
-python3 -m unittest discover -s tests -v
+python3 -B -m unittest discover -s tests -v
 ```
 
-如需核对 AstrBot 源码中的实际分发与 LLM 回退方法，克隆源码并获取测试标签：
+需要核对实际框架发送方法和 TTS 插件时，提供各自源码路径：
 
 ```sh
-git clone --depth 1 https://github.com/AstrBotDevs/AstrBot.git /tmp/astrbot-batchrecall-review
-git -C /tmp/astrbot-batchrecall-review fetch --depth 1 origin tag v4.5.0 tag v4.20.0
-ASTRBOT_SOURCE=/tmp/astrbot-batchrecall-review python3 -m unittest discover -s tests -v
+ASTRBOT_SOURCE=/path/to/AstrBot TTS_SOURCE=/path/to/astrbot_plugin_gsvi_short_tts \
+  python3 -B -m unittest discover -s tests -v
 ```
 
-源码回归测试直接加载事件状态、`call_handler`、`StarRequestSubStage` 和 `ProcessStage` 的方法体，
-以替身隔离 QQ 网络、LLM 和发送阶段，覆盖其他插件回复/静默指令、显式 LLM 请求、普通聊天及静默撤回。
-插件回归还模拟协议请求一直不返回，验证超时后保留历史、下一条「撤回自身」可继续执行，以及重复分发只执行一次。
-默认测试 `v4.5.0`、`v4.20.0` 和 `HEAD`，可通过 `ASTRBOT_REFS` 指定逗号分隔的版本。
-本次核对的 HEAD 为 `67c74b7`（AstrBot 4.28.1）；这些测试不代替真实 QQ 协议端联调。
+联调覆盖两个插件的加载顺序、普通和流式语音、文字回退、混合消息、平台发送失败、音频生命周期、连续引用撤回、LLM 持锁并发、固定编号及卸载恢复。部署和真实 QQ 平台验证由维护者执行。
 
-## 🐔 联系作者
-
-- **反馈**：欢迎在 [GitHub Issues](https://github.com/1592363624/astrbot_plugin_batchrecall/issues) 提交问题或建议
-QQ群:91219736
-telegram:[巅峰阁](https://t.me/ShellDFG)
+原项目：https://github.com/1592363624/astrbot_plugin_batchrecall
